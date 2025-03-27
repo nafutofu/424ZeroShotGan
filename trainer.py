@@ -3,6 +3,7 @@
 import os
 import time
 import datetime
+import random
 import torch
 import torch.nn.functional as F
 import itertools
@@ -56,6 +57,7 @@ class Solver(object):
         self.beta2 = config.beta2
         self.resume_iters = config.resume_iters
         self.test_iters = config.test_iters
+        self.num_test_imgs = config.num_test_imgs
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print('Using device:', self.device)
@@ -211,11 +213,21 @@ class Solver(object):
                     param_group['lr'] = d_lr
                 print(f'Decayed learning rates, g_lr: {g_lr:.6f}, d_lr: {d_lr:.6f}')
 
+
+
     def test(self):
         print('Running test...')
         self.restore_model(self.test_iters)
         self.encoder.eval()
         self.decoder.eval()
+
+        # Get total test size
+        test_len = len(self.data_loader.test)
+        max_visuals = self.config.num_test_imgs
+
+        # Pick N unique indices randomly
+        visual_indices = set(random.sample(range(test_len), max_visuals))
+        test_batch = 1
 
         with torch.no_grad():
             for i, (gray, rgb) in enumerate(self.data_loader.test):
@@ -224,7 +236,14 @@ class Solver(object):
                 content = self.encoder(gray)
                 fake = self.decoder(content)
 
-                merged = torch.cat([gray.expand(-1, 3, -1, -1), fake, rgb], dim=0)
-                result_path = os.path.join(self.result_dir, f'{i + 1}_test.jpg')
-                save_image(self.denorm(merged.data.cpu()), result_path, nrow=gray.size(0))
-                print(f'Saved result to {result_path}')
+                if i in visual_indices:
+
+                    merged = torch.cat([gray.expand(-1, 3, -1, -1), fake, rgb], dim=0)
+                    result_path = os.path.join(self.result_dir, f'{test_batch + 1}_test.jpg')
+                    save_image(self.denorm(merged.data.cpu()), result_path, nrow=gray.size(0))
+                    print(f'Saved result to {result_path}')
+                    test_batch += 1
+
+                # METRICS HERE
+
+

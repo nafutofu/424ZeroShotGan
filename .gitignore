@@ -1,4 +1,5 @@
 data/train/**
+data/**
 data/test/**
 Outputs/**
 
