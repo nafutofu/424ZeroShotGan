@@ -1,0 +1,10 @@
+data/train/**
+data/test/**
+Outputs/**
+
+!data/train/**/.gitkeep
+!data/test/**/.gitkeep
+!data/test/**/.gitkeep
+
+**/*.jpg
+**/*.pyc
