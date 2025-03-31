@@ -227,7 +227,9 @@ class Solver(object):
 
         # Pick N unique indices randomly
         visual_indices = set(random.sample(range(test_len), max_visuals))
-        test_batch = 1
+        test_batch = 0
+
+        print(f"Batch Index Viewed: {visual_indices}")
 
         with torch.no_grad():
             for i, (gray, rgb) in enumerate(self.data_loader.test):
