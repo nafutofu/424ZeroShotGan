@@ -19,8 +19,8 @@ class Config:
     d_lr = 0.0001
     beta1 = 0.5
     beta2 = 0.999
-    resume_iters = 4000  # or whichever checkpoint you want to load
-    test_iters = 4000  # must match saved checkpoint
+    resume_iters = 200  # or whichever checkpoint you want to load
+    test_iters = 200  # must match saved checkpoint
     num_test_imgs = 5
     num_iters_decay = 5
     sample_step = 1000

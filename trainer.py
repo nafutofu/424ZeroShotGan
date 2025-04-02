@@ -9,6 +9,8 @@ import torch.nn.functional as F
 import itertools
 from torchvision.utils import save_image
 from model import ContentEncoder, Decoder, Discriminator
+import cv2
+import numpy as np
 
 import torchvision.models as models
 import torch.nn as nn
@@ -79,6 +81,24 @@ class Solver(object):
 
         self.build_model()
 
+    def lab_to_rgb(self, L, ab):
+        # De-normalise
+        L = L * 50 + 50
+        ab = ab * 127
+
+        lab = torch.cat([L, ab], dim=1).permute(0, 2, 3, 1).cpu().numpy()  # (B, H, W, C)
+
+        rgb_images = []
+        for img_lab in lab:
+            img_lab = img_lab.astype(np.float32)
+            img_rgb = cv2.cvtColor(img_lab, cv2.COLOR_Lab2RGB)
+            img_rgb = np.clip(img_rgb, 0, 1)  # ensure valid range
+            rgb_images.append(torch.from_numpy(img_rgb).permute(2, 0, 1))  # (3, H, W)
+
+        return torch.stack(rgb_images).to(self.device)
+
+
+
     def build_model(self):
         # Define networks
         self.encoder = ContentEncoder(
@@ -94,7 +114,7 @@ class Solver(object):
             n_upsample=2,
             n_res=8,
             dim=256,           # dim should match encoder's output
-            output_dim=3,      # RGB output
+            output_dim=2,      # RGB output
             res_norm='in',
             activ='relu',
             pad_type='reflect'
@@ -120,8 +140,6 @@ class Solver(object):
         self.g_optimizer.zero_grad()
         self.d_optimizer.zero_grad()
 
-    def denorm(self, x):
-        return (x + 1) / 2
 
     def restore_model(self, resume_iters):
         print(f'Loading model from iteration {resume_iters}')
@@ -138,27 +156,29 @@ class Solver(object):
 
         if self.resume_iters:
             self.restore_model(self.resume_iters)
+        
+        self._train_iter = iter(self.data_loader.train)  # <- Add this line!
 
         for i in range(self.num_iters):
             try:
-                gray, rgb = next(self._train_iter)
+                L, ab = next(self._train_iter)
             except (AttributeError, StopIteration):
                 self._train_iter = iter(self.data_loader.train)
-                gray, rgb = next(self._train_iter)
+                L, ab = next(self._train_iter)
 
-            gray = gray.to(self.device)
-            rgb = rgb.to(self.device)
+            L = L.to(self.device)      # Grayscale input
+            ab = ab.to(self.device)    # Colour targets
 
             # === Train Discriminator ===
-            out_src_real, _ = self.D(rgb)
-            d_loss_real = -torch.mean(out_src_real)
+            fake_ab = self.decoder(self.encoder(L))
+            fake_lab = torch.cat([L, fake_ab], dim=1)
+            real_lab = torch.cat([L, ab], dim=1)
 
-            x_content = self.encoder(gray)
-            batch_size = gray.size(0)
-            x_fake = self.decoder(x_content)
+            out_real, _ = self.D(real_lab)
+            d_loss_real = -torch.mean(out_real)
 
-            out_src_fake, _ = self.D(x_fake.detach())
-            d_loss_fake = torch.mean(out_src_fake)
+            out_fake, _ = self.D(fake_lab.detach())
+            d_loss_fake = torch.mean(out_fake)
 
             d_loss = d_loss_real + d_loss_fake
             self.reset_grad()
@@ -167,12 +187,12 @@ class Solver(object):
 
             # === Train Generator ===
             if (i + 1) % self.n_critic == 0:
-                out_src_fake, _ = self.D(x_fake)
-                g_loss_fake = -torch.mean(out_src_fake)
-               #  g_loss_rec = F.l1_loss(x_fake, rgb)
-                x_fake_vgg = (x_fake + 1) / 2
-                rgb_vgg = (rgb + 1) / 2
-                g_loss_rec = self.vgg_loss(x_fake_vgg, rgb_vgg)
+                fake_ab = self.decoder(self.encoder(L))
+                fake_lab = torch.cat([L, fake_ab], dim=1)
+                out_fake, _ = self.D(fake_lab)
+
+                g_loss_fake = -torch.mean(out_fake)
+                g_loss_rec = F.l1_loss(fake_ab, ab)
                 g_loss = g_loss_fake + self.lambda_rec * g_loss_rec
 
                 self.reset_grad()
@@ -181,8 +201,8 @@ class Solver(object):
 
             # === Logging ===
             if (i + 1) % self.log_step == 0:
-                et = str(datetime.timedelta(seconds=time.time() - start_time))[:-7]
-                log = f"Elapsed [{et}], Iteration [{i + 1}/{self.num_iters}]"
+                elapsed = str(datetime.timedelta(seconds=time.time() - start_time))[:-7]
+                log = f"Elapsed [{elapsed}], Iteration [{i + 1}/{self.num_iters}]"
                 log += f", D/loss_real: {d_loss_real.item():.4f}, D/loss_fake: {d_loss_fake.item():.4f}"
                 if (i + 1) % self.n_critic == 0:
                     log += f", G/loss_fake: {g_loss_fake.item():.4f}, G/loss_rec: {g_loss_rec.item():.4f}"
@@ -191,9 +211,13 @@ class Solver(object):
             # === Save Sample Images ===
             if (i + 1) % self.sample_step == 0:
                 with torch.no_grad():
-                    merged = torch.cat([gray.expand(-1, 3, -1, -1), x_fake, rgb], dim=0)
+                    fake_ab = self.decoder(self.encoder(L))
+                    fake_rgb = self.lab_to_rgb(L, fake_ab)
+                    real_rgb = self.lab_to_rgb(L, ab)
+                    gray3 = L.expand(-1, 3, -1, -1)
+                    merged = torch.cat([gray3, fake_rgb, real_rgb], dim=0)
                     sample_path = os.path.join(self.sample_dir, f'{i + 1}_samples.jpg')
-                    save_image(self.denorm(merged.data.cpu()), sample_path, nrow=gray.size(0))
+                    save_image(merged.data.cpu(), sample_path, nrow=L.size(0))
                     print(f'Saved samples to {sample_path}')
 
             # === Save Model Checkpoints ===
@@ -215,37 +239,35 @@ class Solver(object):
 
 
 
+
     def test(self):
         print('Running test...')
         self.restore_model(self.test_iters)
         self.encoder.eval()
         self.decoder.eval()
 
-        # Get total test size
         test_len = len(self.data_loader.test)
         max_visuals = self.config.num_test_imgs
-
-        # Pick N unique indices randomly
         visual_indices = set(random.sample(range(test_len), max_visuals))
         test_batch = 0
 
         print(f"Batch Index Viewed: {visual_indices}")
 
         with torch.no_grad():
-            for i, (gray, rgb) in enumerate(self.data_loader.test):
-                gray = gray.to(self.device)
-                rgb = rgb.to(self.device)
-                content = self.encoder(gray)
-                fake = self.decoder(content)
+            for i, (L, ab) in enumerate(self.data_loader.test):
+                L = L.to(self.device)
+                ab = ab.to(self.device)
+                fake_ab = self.decoder(self.encoder(L))
 
                 if i in visual_indices:
-
-                    merged = torch.cat([gray.expand(-1, 3, -1, -1), fake, rgb], dim=0)
+                    fake_rgb = self.lab_to_rgb(L, fake_ab)
+                    real_rgb = self.lab_to_rgb(L, ab)
+                    gray3 = L.expand(-1, 3, -1, -1)
+                    merged = torch.cat([gray3, fake_rgb, real_rgb], dim=0)
                     result_path = os.path.join(self.result_dir, f'{test_batch + 1}_test.jpg')
-                    save_image(self.denorm(merged.data.cpu()), result_path, nrow=gray.size(0))
+                    save_image(merged.data.cpu(), result_path, nrow=L.size(0))
                     print(f'Saved result to {result_path}')
                     test_batch += 1
 
-                # METRICS HERE
 
 
