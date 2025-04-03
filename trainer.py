@@ -50,6 +50,7 @@ class Solver(object):
         self.d_conv_dim = config.d_conv_dim
         self.d_repeat_num = config.d_repeat_num
         self.lambda_rec = config.lambda_rec
+        self.lambda_hist = config.lambda_hist
         self.batch_size = config.batch_size
         self.num_iters = config.num_iters
         self.n_critic = config.n_critic
@@ -97,6 +98,35 @@ class Solver(object):
 
         return torch.stack(rgb_images).to(self.device)
 
+    def compute_soft_histogram_loss(self, pred_ab, gt_ab, bins=64, range_min=-1.0, range_max=1.0, sigma=0.02):
+
+        device = pred_ab.device
+        bin_centers = torch.linspace(range_min, range_max, steps=bins).to(device)  # [bins]
+
+        loss = 0.0
+
+        for channel in range(2):  # a and b channels
+            pred_vals = pred_ab[:, channel, :, :].reshape(-1)  # [B*H*W]
+            gt_vals = gt_ab[:, channel, :, :].reshape(-1)
+
+            # [bins, B*H*W]
+            pred_diff = pred_vals[None, :] - bin_centers[:, None]  # broadcasting
+            gt_diff = gt_vals[None, :] - bin_centers[:, None]
+
+            pred_weights = torch.exp(-0.5 * (pred_diff / sigma) ** 2)  # Gaussian kernel
+            gt_weights = torch.exp(-0.5 * (gt_diff / sigma) ** 2)
+
+            # [bins]
+            pred_hist = pred_weights.sum(dim=1)
+            gt_hist = gt_weights.sum(dim=1)
+
+            # Normalise to sum to 1
+            pred_hist /= (pred_hist.sum() + 1e-6)
+            gt_hist /= (gt_hist.sum() + 1e-6)
+
+            loss += F.l1_loss(pred_hist, gt_hist)
+
+        return loss
 
 
     def build_model(self):
@@ -157,7 +187,7 @@ class Solver(object):
         if self.resume_iters:
             self.restore_model(self.resume_iters)
         
-        self._train_iter = iter(self.data_loader.train)  # <- Add this line!
+        self._train_iter = iter(self.data_loader.train)
 
         for i in range(self.num_iters):
             try:
@@ -193,7 +223,8 @@ class Solver(object):
 
                 g_loss_fake = -torch.mean(out_fake)
                 g_loss_rec = F.l1_loss(fake_ab, ab)
-                g_loss = g_loss_fake + self.lambda_rec * g_loss_rec
+                g_loss_hist = self.compute_soft_histogram_loss(fake_ab, ab)
+                g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_hist * g_loss_hist
 
                 self.reset_grad()
                 g_loss.backward()
@@ -202,10 +233,11 @@ class Solver(object):
             # === Logging ===
             if (i + 1) % self.log_step == 0:
                 elapsed = str(datetime.timedelta(seconds=time.time() - start_time))[:-7]
-                log = f"Elapsed [{elapsed}], Iteration [{i + 1}/{self.num_iters}]"
-                log += f", D/loss_real: {d_loss_real.item():.4f}, D/loss_fake: {d_loss_fake.item():.4f}"
+                log = f"Elapsed [{elapsed}], Iteration [{i + 1}/{self.num_iters}]\n"
+                log += f"D/loss_real: {d_loss_real.item():.4f}, D/loss_fake: {d_loss_fake.item():.4f}\n"
                 if (i + 1) % self.n_critic == 0:
-                    log += f", G/loss_fake: {g_loss_fake.item():.4f}, G/loss_rec: {g_loss_rec.item():.4f}"
+                    log += f"G/loss_fake: {g_loss_fake.item():.4f}, G/loss_rec: {g_loss_rec.item():.4f}"
+                    log += f", G/loss_hist: {g_loss_hist.item():.4f}"
                 print(log)
 
             # === Save Sample Images ===
