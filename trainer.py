@@ -8,9 +8,10 @@ import torch
 import torch.nn.functional as F
 import itertools
 from torchvision.utils import save_image
-from model import ContentEncoder, Decoder, Discriminator
+from model import ContentEncoder, Decoder, Discriminator, Generator
 import cv2
 import numpy as np
+import clip
 
 import torchvision.models as models
 import torch.nn as nn
@@ -35,7 +36,6 @@ class VGGPerceptualLoss(nn.Module):
             if i in self.selected_layers:
                 loss += self.criterion(x_vgg, y_vgg)
         return loss
-
 
 class Solver(object):
     def __init__(self, data_loader, config):
@@ -125,45 +125,36 @@ class Solver(object):
             gt_hist /= (gt_hist.sum() + 1e-6)
 
             loss += F.l1_loss(pred_hist, gt_hist)
-
         return loss
 
 
     def build_model(self):
         # Define networks
-        self.encoder = ContentEncoder(
-            n_downsample=2,
-            n_res=8,
+        self.G = Generator(
             input_dim=1,
+            output_dim=2,
             dim=64,
-            norm='in',
-            activ='relu',
-            pad_type='reflect'
-        )
-        self.decoder = Decoder(
-            n_upsample=2,
             n_res=8,
-            dim=256,           # dim should match encoder's output
-            output_dim=2,      # RGB output
+            n_downsample=2,
+            n_upsample=2,
+            norm_type='in',
             res_norm='in',
             activ='relu',
-            pad_type='reflect'
-        )
+            pad_type='reflect',
+            clip_dim=512,
+            image_size=self.image_size
+        ).to(self.device)
 
         self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num, ft_num=self.ft_num)
 
         # Define optimizers
         self.g_optimizer = torch.optim.Adam(
-            itertools.chain(self.encoder.parameters(), self.decoder.parameters()),
+            self.G.parameters(),
             self.g_lr, [self.beta1, self.beta2]
         )
         self.d_optimizer = torch.optim.Adam(
             self.D.parameters(), self.d_lr, [self.beta1, self.beta2]
         )
-
-        # Move models to device
-        self.encoder.to(self.device)
-        self.decoder.to(self.device)
         self.D.to(self.device)
 
     def reset_grad(self):
@@ -173,9 +164,9 @@ class Solver(object):
 
     def restore_model(self, resume_iters):
         print(f'Loading model from iteration {resume_iters}')
-        self.encoder.load_state_dict(torch.load(os.path.join(self.model_save_dir, f'{resume_iters}-encoder.ckpt')))
-        self.decoder.load_state_dict(torch.load(os.path.join(self.model_save_dir, f'{resume_iters}-decoder.ckpt')))
+        self.G.load_state_dict(torch.load(os.path.join(self.model_save_dir, f'{resume_iters}-G.ckpt')))
         self.D.load_state_dict(torch.load(os.path.join(self.model_save_dir, f'{resume_iters}-D.ckpt')))
+
 
     def train(self):
         print('Start training...')
@@ -186,21 +177,23 @@ class Solver(object):
 
         if self.resume_iters:
             self.restore_model(self.resume_iters)
-        
+
         self._train_iter = iter(self.data_loader.train)
 
         for i in range(self.num_iters):
             try:
-                L, ab = next(self._train_iter)
+                L, ab, prompt_embed = next(self._train_iter)
             except (AttributeError, StopIteration):
                 self._train_iter = iter(self.data_loader.train)
-                L, ab = next(self._train_iter)
+                L, ab, prompt_embed = next(self._train_iter)
 
-            L = L.to(self.device)      # Grayscale input
-            ab = ab.to(self.device)    # Colour targets
+            L = L.to(self.device)
+            ab = ab.to(self.device)
+            prompt_embed = prompt_embed.to(self.device, dtype=torch.float32)
+
 
             # === Train Discriminator ===
-            fake_ab = self.decoder(self.encoder(L))
+            fake_ab = self.G(L, prompt_embed)
             fake_lab = torch.cat([L, fake_ab], dim=1)
             real_lab = torch.cat([L, ab], dim=1)
 
@@ -211,20 +204,25 @@ class Solver(object):
             d_loss_fake = torch.mean(out_fake)
 
             d_loss = d_loss_real + d_loss_fake
+
             self.reset_grad()
             d_loss.backward()
             self.d_optimizer.step()
 
             # === Train Generator ===
             if (i + 1) % self.n_critic == 0:
-                fake_ab = self.decoder(self.encoder(L))
+                fake_ab = self.G(L, prompt_embed)
                 fake_lab = torch.cat([L, fake_ab], dim=1)
                 out_fake, _ = self.D(fake_lab)
 
                 g_loss_fake = -torch.mean(out_fake)
                 g_loss_rec = F.l1_loss(fake_ab, ab)
                 g_loss_hist = self.compute_soft_histogram_loss(fake_ab, ab)
-                g_loss = g_loss_fake + self.lambda_rec * g_loss_rec + self.lambda_hist * g_loss_hist
+                g_loss = (
+                    g_loss_fake +
+                    self.lambda_rec * g_loss_rec +
+                    self.lambda_hist * g_loss_hist
+                )
 
                 self.reset_grad()
                 g_loss.backward()
@@ -235,15 +233,13 @@ class Solver(object):
                 elapsed = str(datetime.timedelta(seconds=time.time() - start_time))[:-7]
                 log = f"Elapsed [{elapsed}], Iteration [{i + 1}/{self.num_iters}]\n"
                 log += f"D/loss_real: {d_loss_real.item():.4f}, D/loss_fake: {d_loss_fake.item():.4f}\n"
-                if (i + 1) % self.n_critic == 0:
-                    log += f"G/loss_fake: {g_loss_fake.item():.4f}, G/loss_rec: {g_loss_rec.item():.4f}"
-                    log += f", G/loss_hist: {g_loss_hist.item():.4f}"
+                log += f"G/loss_fake: {g_loss_fake.item():.4f}, G/loss_rec: {g_loss_rec.item():.4f}, G/loss_hist: {g_loss_hist.item():.4f}"
                 print(log)
 
             # === Save Sample Images ===
             if (i + 1) % self.sample_step == 0:
                 with torch.no_grad():
-                    fake_ab = self.decoder(self.encoder(L))
+                    fake_ab = self.G(L, prompt_embed)
                     fake_rgb = self.lab_to_rgb(L, fake_ab)
                     real_rgb = self.lab_to_rgb(L, ab)
                     gray3 = L.expand(-1, 3, -1, -1)
@@ -254,8 +250,7 @@ class Solver(object):
 
             # === Save Model Checkpoints ===
             if (i + 1) % self.model_save_step == 0:
-                torch.save(self.encoder.state_dict(), os.path.join(self.model_save_dir, f'{i + 1}-encoder.ckpt'))
-                torch.save(self.decoder.state_dict(), os.path.join(self.model_save_dir, f'{i + 1}-decoder.ckpt'))
+                torch.save(self.G.state_dict(), os.path.join(self.model_save_dir, f'{i + 1}-G.ckpt'))
                 torch.save(self.D.state_dict(), os.path.join(self.model_save_dir, f'{i + 1}-D.ckpt'))
                 print(f'Saved model checkpoints at iteration {i + 1}')
 
@@ -271,35 +266,39 @@ class Solver(object):
 
 
 
+    def test(self, prompt="red flowers"):
+        from torchvision.utils import save_image
 
-    def test(self):
-        print('Running test...')
-        self.restore_model(self.test_iters)
-        self.encoder.eval()
-        self.decoder.eval()
+        print(f"[INFO] Running test with prompt: '{prompt}'")
 
-        test_len = len(self.data_loader.test)
-        max_visuals = self.config.num_test_imgs
-        visual_indices = set(random.sample(range(test_len), max_visuals))
-        test_batch = 0
-
-        print(f"Batch Index Viewed: {visual_indices}")
+        # Load CLIP
+        self.clip_model, _ = clip.load("ViT-B/32", device=self.device)
+        self.clip_model.eval()
 
         with torch.no_grad():
-            for i, (L, ab) in enumerate(self.data_loader.test):
-                L = L.to(self.device)
-                ab = ab.to(self.device)
-                fake_ab = self.decoder(self.encoder(L))
+            # Encode the prompt to CLIP embedding
+            token = clip.tokenize([prompt]).to(self.device)
+            prompt_embed = self.clip_model.encode_text(token)  # [1, 512]
+            prompt_embed = prompt_embed.to(dtype=torch.float32)
 
-                if i in visual_indices:
-                    fake_rgb = self.lab_to_rgb(L, fake_ab)
-                    real_rgb = self.lab_to_rgb(L, ab)
-                    gray3 = L.expand(-1, 3, -1, -1)
-                    merged = torch.cat([gray3, fake_rgb, real_rgb], dim=0)
-                    result_path = os.path.join(self.result_dir, f'{test_batch + 1}_test.jpg')
-                    save_image(merged.data.cpu(), result_path, nrow=L.size(0))
-                    print(f'Saved result to {result_path}')
-                    test_batch += 1
+            # Loop through test data
+            for idx, (L, ab, _) in enumerate(self.data_loader.test):
+                L = L.to(self.device)               # [1, 1, H, W]
+                prompt_embed_batch = prompt_embed.repeat(L.size(0), 1)  # match batch size
+
+                fake_ab = self.G(L, prompt_embed_batch)  # colourise
+
+                fake_rgb = self.lab_to_rgb(L, fake_ab)
+                gray3 = L.expand(-1, 3, -1, -1)
+                merged = torch.cat([gray3, fake_rgb], dim=0)
+
+                # Save image
+                prompt_tag = prompt.replace(" ", "_").lower()
+                os.makedirs(self.result_dir, exist_ok=True)
+                out_path = os.path.join(self.result_dir, f"{idx+1}_{prompt_tag}.jpg")
+                save_image(merged.cpu(), out_path, nrow=gray3.size(0))
+                print(f"[✓] Saved: {out_path}")
+
 
 
 

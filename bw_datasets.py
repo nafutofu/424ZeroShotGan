@@ -30,7 +30,7 @@ def load_prompt_csv(csv_path):
         reader = csv.DictReader(f)
         for row in reader:
             image_path = row["image_path"]
-            prompts = ast.literal_eval(row["top3_prompts"])  # e.g., "['red bird', 'vivid bird']"
+            prompts = ast.literal_eval(row["top_prompts"])  # e.g., "['red bird', 'vivid bird']"
             mapping[image_path] = prompts
     return mapping
 
@@ -74,7 +74,7 @@ class ImageColorizationDataset(Dataset):
         image_path = str(self.image_paths[idx])
         image = Image.open(image_path).convert("RGB")
         lab = rgb_to_lab_tensor(image, self.image_size)
-        
+
         L = lab[0:1, :, :]
         ab = lab[1:3, :, :]
 

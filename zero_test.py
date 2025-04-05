@@ -20,8 +20,8 @@ class Config:
     d_lr = 0.0001
     beta1 = 0.5
     beta2 = 0.999
-    resume_iters = 1000  # or whichever checkpoint you want to load
-    test_iters = 1000  # must match saved checkpoint
+    test_iters = 4000  # must match saved checkpoint
+    resume_iters = test_iters  # or whichever checkpoint you want to load
     num_test_imgs = 5
     num_iters_decay = 5
     sample_step = 1000
@@ -39,7 +39,7 @@ os.makedirs(Config.result_dir, exist_ok=True)
 
 # --- Load flower dataset ---
 flower_dataset = ImageColorizationDataset("data/test/", image_size=Config.image_size)
-flower_loader = DataLoader(flower_dataset, batch_size=Config.batch_size, shuffle=False)
+flower_loader = DataLoader(flower_dataset, batch_size=Config.batch_size, shuffle=True)
 
 # --- Dummy loader to match Solver's expected structure ---
 class DummyLoader:

@@ -1,7 +1,18 @@
-# Cleaned-up model.py for grayscale-to-color image colorization using ZstGAN backbone
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+def adain(content_feat, style_feat):
+    # content_feat: (B, C, H, W), style_feat: (B, C)
+    size = content_feat.size()
+    style_mean = style_feat.unsqueeze(2).unsqueeze(3)  # [B, C, 1, 1]
+    style_std = torch.ones_like(style_mean)  # Default scale of 1
+
+    content_mean = content_feat.mean(dim=[2, 3], keepdim=True)
+    content_std = content_feat.std(dim=[2, 3], keepdim=True) + 1e-5
+
+    normalized = (content_feat - content_mean) / content_std
+    return normalized * style_std + style_mean
 
 
 # === Content Encoder ===
@@ -31,8 +42,65 @@ class Decoder(nn.Module):
         layers += [Conv2dBlock(dim, output_dim, 7, 1, 3, norm='none', activation='tanh', pad_type=pad_type)]
         self.model = nn.Sequential(*layers)
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, style_mean=None, style_std=None):
+        for i, layer in enumerate(self.model):
+            if isinstance(layer, ResBlocks) and style_mean is not None and style_std is not None:
+                x = adain(layer(x), style_mean, style_std)
+            else:
+                x = layer(x)
+        return x
+
+class Generator(nn.Module):
+    def __init__(
+        self,
+        input_dim=1,
+        output_dim=2,
+        dim=64,
+        n_res=8,
+        n_downsample=2,
+        n_upsample=2,
+        norm_type="in",
+        res_norm="in",
+        activ="relu",
+        pad_type="reflect",
+        clip_dim=512,
+        image_size=128
+    ):
+        super().__init__()
+        self.encoder = ContentEncoder(
+            n_downsample=n_downsample,
+            n_res=n_res,
+            input_dim=input_dim,
+            dim=dim,
+            norm=norm_type,
+            activ=activ,
+            pad_type=pad_type
+        )
+
+        self.decoder = Decoder(
+            n_upsample=n_upsample,
+            n_res=n_res,
+            dim=self.encoder.output_dim,
+            output_dim=output_dim,
+            res_norm=res_norm,
+            activ=activ,
+            pad_type=pad_type
+        )
+
+        # Style network for AdaIN
+        self.style_mlp = nn.Sequential(
+            nn.Linear(clip_dim, self.encoder.output_dim),
+            nn.ReLU(),
+            nn.Linear(self.encoder.output_dim, self.encoder.output_dim)
+        )
+
+    def forward(self, L, prompt_embed):
+        content_feat = self.encoder(L)                    # [B, C, H, W]
+        style_vector = self.style_mlp(prompt_embed)       # [B, C]
+        fake_ab = self.decoder(content_feat, style_vector)
+        return fake_ab
+
+
 
 # === Residual Blocks ===
 class ResBlocks(nn.Module):
